@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
 dev = [
     "pre-commit",
     "ruff",
