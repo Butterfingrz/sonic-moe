@@ -3,19 +3,78 @@
 # ********************************************************************************
 
 import argparse
+import itertools
 import random
 import time
+from functools import partial
 from typing import Tuple, Type
 
 import cutlass
+
+# ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
+# !!!!!!!!!! The following code is to accelerate the autotuning process in QuACK and IS REMOVABLE (does not affect correctness) !!!!!!!!!!
+import quack.gemm_config as _gc
 import torch
 import torch.nn.functional as F
+from quack.autotuner import AutotuneConfig
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 from rich import print as print0
 from triton.testing import do_bench
 
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
+
+
+def _fast_sm100_configs(epilogue=None):
+    tile_n_vals = [128, 160, 192, 256]
+    tile_mn_cluster_vals = (
+        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
+        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, 512, (2, 1))]
+    )
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)
+    use_clc_vals = [True, False]
+    use_tma_gather_vals = [True, False]
+    return [
+        GemmConfigCls(
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
+        )
+        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
+        )
+    ]
+
+
+_gc._get_sm100_configs = _fast_sm100_configs
+
+
+def _patch_autotuner_configs(autotuner_fn):
+    all_new = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
+    autotuner_fn.configs = all_new
+
+
+# Patch the 3 autotuners used in MoE SwiGLU fwd+bwd
+_patch_autotuner_configs(gemm_tuned)
+_patch_autotuner_configs(gemm_gated_tuned)
+_patch_autotuner_configs(gemm_dgated_tuned)
+
+gemm_gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+
+# ─────────────── Monkey-patch ends ───────────────
 
 
 def swiglu(x: torch.Tensor) -> torch.Tensor:
@@ -86,6 +145,18 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--topk_over_softmax",
+        action="store_true",
+        default=False,
+        help="Use topk(softmax(.)) routing (Qwen3 style) instead of softmax(topk(.))",
+    )
+    parser.add_argument(
+        "--norm_topk_probs",
+        action="store_true",
+        default=False,
+        help="Renormalize topk probs to sum to 1 (only for softmax-then-topk)",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -107,6 +178,8 @@ def run(
     skip_test: Type[bool],
     add_bias: Type[bool],
     activation: Type[str],
+    is_softmax_over_topk: bool = True,
+    norm_topk_probs: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -115,7 +188,8 @@ def run(
     # Unpack parameters
     T, H, I, E, K = thiek
     TK = T * K
-    print(f"T {T}, I {I}, H {H}, E {E}, K {K}")
+    routing_mode = "softmax_over_topk" if is_softmax_over_topk else f"topk_over_softmax (norm={norm_topk_probs})"
+    print(f"T {T}, I {I}, H {H}, E {E}, K {K}, routing: {routing_mode}")
 
     random.seed(1111)
     torch.manual_seed(1111)
@@ -148,7 +222,17 @@ def run(
     # # Ref check
     if not skip_test:
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, activation
+            x,
+            router_w,
+            w1.permute(1, 2, 0),
+            b1,
+            w2.permute(1, 2, 0),
+            b2,
+            moe.top_k,
+            moe.stream_id,
+            activation,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -158,8 +242,15 @@ def run(
             dx, dw1, dw2, drouter_w = torch.autograd.grad(o, [x, w1, w2, router_w], grad_outputs=dout)
 
         logits = F.linear(x, router_w)
-        ref_topk_logits, ref_topk_experts = logits.topk(K, dim=-1)
-        ref_topk_scores = ref_topk_logits.softmax(dim=-1, dtype=torch.float32)
+
+        if is_softmax_over_topk:
+            ref_topk_logits, ref_topk_experts = logits.topk(K, dim=-1)
+            ref_topk_scores = ref_topk_logits.softmax(dim=-1, dtype=torch.float32)
+        else:
+            ref_probs = logits.softmax(dim=-1, dtype=torch.float32)
+            ref_topk_scores, ref_topk_experts = ref_probs.topk(K, dim=-1)
+            if norm_topk_probs:
+                ref_topk_scores = ref_topk_scores / ref_topk_scores.sum(dim=-1, keepdim=True)
 
         ref_topk_expert_idx, ref_s_scatter_idx = ref_topk_experts.flatten().sort()
         ref_topk_expert_idx, ref_s_scatter_idx = ref_topk_expert_idx.int(), ref_s_scatter_idx.int()
@@ -246,18 +337,16 @@ def run(
         w2.permute(1, 2, 0),
         b2,
         moe.top_k,
-        moe.stream_id,
+        None,  # current code doesn't need stream id at all. Keep it here for legacy reason
         activation,
         True,
+        is_softmax_over_topk=is_softmax_over_topk,
+        norm_topk_probs=norm_topk_probs,
     )
 
     cuda_graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-
-    # Redirect CuTe kernels to capture stream
-    old_stream_id = moe.stream_id
-    moe.stream_id = stream.cuda_stream
 
     # ── Inference mode, Forward only (with cudagraphs) ──
     with torch.cuda.stream(stream):
@@ -270,16 +359,42 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 moe.top_k,
-                moe.stream_id,
+                None,  # current code doesn't need stream id at all. Keep it here for legacy reason
                 activation,
                 True,
+                is_softmax_over_topk=is_softmax_over_topk,
+                norm_topk_probs=norm_topk_probs,
             )
-
-    moe.stream_id = old_stream_id  # restore
 
     fwd_timing = do_bench(lambda: cuda_graph.replay(), warmup=warmup, rep=repeats)
     tflops = flops / (fwd_timing * 1e9)
     print0(f" Cute-DSL Fwd (inference mode + cudagraph) Average time: {fwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
+
+    time.sleep(0.5)
+    torch.cuda.synchronize()
+
+    # ── Inference mode, Forward only ──
+    def forward_only_inference_mode():
+        o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
+            x,
+            router_w,
+            w1.permute(1, 2, 0),
+            b1,
+            w2.permute(1, 2, 0),
+            b2,
+            moe.top_k,
+            None,
+            activation,
+            True,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
+        )
+        return o
+
+    time.sleep(0.5)
+    fwd_timing = do_bench(forward_only_inference_mode, warmup=warmup, rep=repeats)
+    tflops = flops / (fwd_timing * 1e9)
+    print0(f" Cute-DSL Fwd (inference mode) Average time: {fwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
     # ── Training mode, Forward only ──
     def forward_only_training_mode():
@@ -291,14 +406,20 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             moe.top_k,
-            moe.stream_id,
+            None,
             activation,
             False,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
         )
         return o
 
+    time.sleep(0.5)
+    torch.cuda.synchronize()
+
     fwd_no_cg_timing = do_bench(forward_only_training_mode, warmup=warmup, rep=repeats)
-    print0(f" Cute-DSL Fwd (training mode) Average time: {fwd_no_cg_timing:.3f} ms")
+    tflops = flops / (fwd_no_cg_timing * 1e9)
+    print0(f" Cute-DSL Fwd (training mode) Average time: {fwd_no_cg_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
     if is_glu(activation):
         flops = 18 * T * I * H * K
@@ -306,6 +427,8 @@ def run(
         flops = 12 * T * I * H * K
 
     time.sleep(0.5)
+    torch.cuda.synchronize()
+    dout = torch.randn_like(x, requires_grad=True)
 
     def forward_and_backward():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
@@ -316,15 +439,17 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             moe.top_k,
-            moe.stream_id,
+            None,
             activation,
             False,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
 
-    e2e_timing = do_bench(forward_and_backward, warmup=warmup, rep=repeats, grad_to_none=[x, w1, w2, router_w, dout])
-    tflops = flops / (e2e_timing * 1e9)  # Convert to TFlops
+    e2e_timing = do_bench(forward_and_backward, warmup=warmup, rep=repeats)
+    tflops = flops / (e2e_timing * 1e9)  # Convert to TFLOPS
     print0(f"[bold green][/bold green] Cute-DSL Fwd + Bwd Average time: {e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
     if is_glu(activation):
@@ -332,12 +457,20 @@ def run(
     else:
         flops = 8 * T * I * H * K
 
-    bwd_time = e2e_timing - fwd_timing
+    bwd_time = e2e_timing - fwd_no_cg_timing
     tflops = flops / (bwd_time / 1e3) / 1e12
     print0(f"[bold green][/bold green] Cute-DSL Bwd Average time: {bwd_time:.3f} ms, TFLOPS: {tflops:.1f}")
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation)
+    run(
+        args.thiek,
+        args.dtype,
+        args.skip_test,
+        args.add_bias,
+        args.activation,
+        is_softmax_over_topk=(not args.topk_over_softmax),
+        norm_topk_probs=args.norm_topk_probs,
+    )
     print("PASS")

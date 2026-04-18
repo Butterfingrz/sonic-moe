@@ -3,21 +3,28 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 ******************************************************************************** -->
 
 # SonicMoE: Accelerating MoE with IO and Tile-aware Optimizations
-[![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080)
+[![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080) [![PyPI](https://img.shields.io/pypi/v/sonic-moe)](https://pypi.org/project/sonic-moe/)
 
-**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell (beta stage) architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput. 
+**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass).
 
-![image](./assets/mem.png)
-![image](./assets/tput.png)
+![Activation Memory](./assets/mem.png)
+![Training Throughput](./assets/tput.png)
+
+## News
+
+- 04/19/2026: we release SonicMoE with Blackwell (SM100) support, built on [QuACK](https://github.com/Dao-AILab/quack)'s Grouped GEMM kernels. 
 
 ## 📦 Installation
 
 ### Prerequisites
 
-- NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell GPUs (GB200, B200). **For B300, please manually upgrade the triton version to 3.6.0**. We need to manually set environment variable `USE_QUACK_GEMM=1` to use the Blackwell kernels.
+- NVIDIA Hopper GPUs (H100, H200, etc.) or Blackwell GPUs (GB200, B200, B300, etc.) 
 - CUDA 12.9+ (13.0+ for B300 GPUs)
-- Python 3.12+
+- Python 3.12+ recommended
 - PyTorch 2.7+ (2.9.1 recommended)
+
+> **B300 users:** please manually upgrade Triton to 3.6.0 after installing PyTorch.
+
 
 ### Install from pip
 ```bash
@@ -72,18 +79,19 @@ make test
 ```
 
 ### Example usage
-- SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
-```python
+
+- SonicMoE with TC top-K routing (softmax-over-topk, or `softmax(topk(logits))`)
+```bash
 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
 ```
 
-- SonicMoE with TC top-K token-choice routing (SwiGLU activation) on Blackwell GPUs. **This feature is currently in beta and supports only SwiGLU.** Full Blackwell kernel coverage will be available in the next release.
-```python
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
+- SonicMoE with Qwen3-style routing (topk-over-softmax, or `topk(softmax(logits))`) with topk probabilities renormalization
+```bash
+python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --topk_over_softmax --norm_topk_probs
 ```
 
 - SonicMoE with token rounding routing (SwiGLU activation)
-```python
+```bash
 python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
 ```
 
