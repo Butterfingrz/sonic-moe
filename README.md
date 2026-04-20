@@ -80,20 +80,30 @@ make test
 
 ### Example usage
 
-- SonicMoE with TC top-K routing (softmax-over-topk, or `softmax(topk(logits))`)
-```bash
-python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
-```
+- SonicMoE with TC top-K routing (softmax-over-topk, or `softmax(topk(logits))`) and interleaved weight layout format for up-proj weights
+    ```bash
+    python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
+    ```
 
-- SonicMoE with Qwen3-style routing (topk-over-softmax, or `topk(softmax(logits))`) with topk probabilities renormalization
-```bash
-python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --topk_over_softmax --norm_topk_probs
-```
+- SonicMoE with Qwen3-style routing (topk-over-softmax, or `topk(softmax(logits))`) with topk probabilities renormalization and interleaved weight layout format for up-proj weights
+    ```bash
+    python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --topk_over_softmax --norm_topk_probs
+    ```
 
-- SonicMoE with token rounding routing (SwiGLU activation)
-```bash
-python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
-```
+- SonicMoE with token rounding routing (SwiGLU activation) and interleaved weight layout format for up-proj weights
+    ```bash
+    python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
+    ```
+
+- SonicMoE with concatenated weight layout format for up-proj weights
+
+    By default, SonicMoE expects `w1` (the gated up-projection weights) in **interleaved** format: `[gate_0, up_0, gate_1, up_1, ...]`. HuggingFace models (Qwen3, Mixtral, DeepSeek, etc.) store `gate_up_proj` in **concatenated** format: `[gate_0, gate_1, ..., gate_{I-1}, up_0, up_1, ..., up_{I-1}]`.
+
+    ```bash
+    # Concatenated weight layout format with TC top-K routing
+    python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --concat_layout
+    ```
+
 
 ## 🤝 Contributing
 
