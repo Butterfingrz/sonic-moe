@@ -7,8 +7,8 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 **SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass).
 
-![Activation Memory](./assets/mem.png)
-![Training Throughput](./assets/tput.png)
+![Activation Memory](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/mem.png)
+![Training Throughput](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/tput.png)
 
 ## News
 
